@@ -12,6 +12,7 @@ The whole idea in one picture:
 Only the two small heads are trained. Qwen itself is never changed.
 """
 import os
+import zlib
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")  # hides a harmless Windows warning
 
@@ -33,6 +34,8 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 QA_PAIRS_PATH = os.path.join(DATA_DIR, "qa_pairs.jsonl")        # written by 1a_build_qa_pairs.py
 AGENT_PAIRS_PATH = os.path.join(DATA_DIR, "agent_pairs.jsonl")  # written by 1b_build_agent_pairs.py
 NEG_PATH = os.path.join(DATA_DIR, "negatives.npz")              # written by 3_mine_negatives.py
+SYN_TEXT_PATH = os.path.join(DATA_DIR, "synthetic_negatives.jsonl")   # written by 2b_write_negatives.py (as it goes)
+SYN_NEG_PATH = os.path.join(DATA_DIR, "synthetic_negatives.npz")      # written by 2b_write_negatives.py (at the end)
 
 
 def emb_path(kind):
@@ -43,6 +46,18 @@ def emb_path(kind):
 def ckpt_path(stage):
     """Where the trained heads of a stage ('pre', 'mid' or 'post') live (written by 4_train.py)."""
     return os.path.join(DATA_DIR, f"heads_{stage}.pt")
+
+
+# ============================ SMALL HELPERS FOR Q&A PAIRS ============================
+def question_of(pair):
+    """The question of a Q&A pair: the text after the last "Question:" in its state."""
+    return pair["state"][-1]["content"].split("Question:")[-1].strip()
+
+
+def pair_key(pair):
+    """A number that identifies a Q&A pair by its question and answer text. Files made for a pair store it, so a rebuilt
+    qa_pairs.jsonl is never matched with extras that belonged to the old pairs."""
+    return zlib.crc32((question_of(pair) + "\x00" + pair["action"]).encode())
 
 
 # ============================ TEXT -> TOKEN IDS (the recipe) ============================

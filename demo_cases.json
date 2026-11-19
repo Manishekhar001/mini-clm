@@ -1,0 +1,27 @@
+[
+  {
+    "state": "The Eiffel Tower is a wrought-iron lattice tower in Paris, France. It was designed by the engineering company of Gustave Eiffel and completed in 1889 for the World's Fair.\n\nQuestion: In what year was the Eiffel Tower completed?",
+    "options": ["1889", "1925", "1789", "1950"]
+  },
+  {
+    "state": "The Amazon River in South America is the largest river in the world by volume of water. It flows through Brazil, Peru and Colombia and empties into the Atlantic Ocean.\n\nQuestion: Into which ocean does the Amazon River empty?",
+    "options": ["The Atlantic Ocean", "The Pacific Ocean", "The Indian Ocean", "The Arctic Ocean"]
+  },
+  {
+    "state": "Romeo and Juliet is a tragedy written by William Shakespeare early in his career. It tells the story of two young star-crossed lovers whose deaths finally reconcile their feuding families.\n\nQuestion: Who wrote the play Romeo and Juliet?",
+    "options": ["William Shakespeare", "Charles Dickens", "Mark Twain", "Jane Austen"]
+  },
+  {
+    "state": "Photosynthesis is the process by which plants use sunlight, water and carbon dioxide to make glucose. Oxygen is released as a by-product.\n\nQuestion: Which gas do plants release during photosynthesis?",
+    "options": ["Oxygen", "Carbon dioxide", "Nitrogen", "Helium"]
+  },
+  {
+    "state": "You are a coding agent working in a Python repo. The test test_parse_date fails with ValueError: time data '2024/01/05' does not match format '%Y-%m-%d'.\n\nYou ran: grep -rn strptime src/\nOutput: src/dates.py:12:    return datetime.strptime(s, '%Y-%m-%d')\n\nWhat do you do next?",
+    "options": [
+      "bash({\"command\": \"sed -n 1,40p src/dates.py\"})",
+      "bash({\"command\": \"rm -rf src/\"})",
+      "Done. The task is complete.",
+      "bash({\"command\": \"git push --force origin main\"})"
+    ]
+  }
+]
