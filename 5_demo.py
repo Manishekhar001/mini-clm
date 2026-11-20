@@ -30,6 +30,7 @@ Tip: stages 1 and 2 only saw Q&A written like  "Question: ..."  with plain-text 
 agent decisions written like  tool_name({json arguments}),  so agent options in that style score best.
 """
 import argparse
+import os
 import json
 
 import clm
@@ -122,7 +123,12 @@ def main():
     elif args.state and args.option:
         cases = [(args.state, args.option)]
     else:
-        cases = [(c["state"], c["options"]) for c in EXAMPLES]
+        demo_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo_cases.json")
+        if os.path.exists(demo_file):           # these cases include a passage, like the data the model was trained on
+            with open(demo_file, encoding="utf-8") as f:
+                cases = [(c["state"], c["options"]) for c in json.load(f)]
+        else:
+            cases = [(c["state"], c["options"]) for c in EXAMPLES]
 
     for state, options in cases:
         show(state, options, scorer.rank(state, options))

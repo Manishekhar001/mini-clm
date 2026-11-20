@@ -136,9 +136,11 @@ def save_vectors(pairs, done):
         raise SystemExit("The writer produced no usable wrong answers. Try --num-pairs 500 and look at the output.")
     tok, model = clm.load_backbone()
     vectors = clm.embed(model, tok, [clm.action_to_ids(tok, t) for t in texts])
+    vectors = clm.center_saved(vectors, "action")      # the same centering as the real answers (needs 2_embed.py to have run)
     np.savez(clm.SYN_NEG_PATH, pair_idx=np.array(idx, dtype=np.int64),
              keys=np.array([clm.pair_key(pairs[i]) for i in idx], dtype=np.int64),
-             texts=np.array(texts), vectors=vectors, model_name=np.array(clm.MODEL_NAME))
+             texts=np.array(texts), vectors=vectors, model_name=np.array(clm.MODEL_NAME),
+             recipe=np.array(clm.RECIPE_ID))
     n_none = sum(1 for i in done if not done[i])
     print(f"Saved {len(texts)} written wrong answers for {len(done) - n_none} pairs ({n_none} pairs got none) to {clm.SYN_NEG_PATH}")
 

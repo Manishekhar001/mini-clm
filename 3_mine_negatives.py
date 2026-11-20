@@ -41,6 +41,8 @@ def main():
     data = np.load(clm.emb_path("qa"))
     if str(data["model_name"]) != clm.MODEL_NAME:
         raise SystemExit(f"Q&A vectors were made with {data['model_name']} but clm.py says {clm.MODEL_NAME}. Rerun step 2.")
+    if "recipe" not in data.files or str(data["recipe"]) != clm.RECIPE_ID:
+        raise SystemExit("The Q&A vectors were made with a different (older) embedding recipe than clm.py says now. Rerun step 2 (python 2_embed.py).")
     with open(clm.QA_PAIRS_PATH, encoding="utf-8") as f:
         pairs = [json.loads(line) for line in f]
     n = len(pairs)
@@ -73,8 +75,8 @@ def main():
     extra, extra_texts = np.zeros((0, data["actions"].shape[1]), dtype=np.float16), []
     if os.path.exists(clm.SYN_NEG_PATH):
         syn = np.load(clm.SYN_NEG_PATH)
-        if str(syn["model_name"]) != clm.MODEL_NAME:
-            print(f"(written negatives skipped: made with {syn['model_name']} but clm.py says {clm.MODEL_NAME}. Rerun 2b.)")
+        if str(syn["model_name"]) != clm.MODEL_NAME or "recipe" not in syn.files or str(syn["recipe"]) != clm.RECIPE_ID:
+            print("(written negatives skipped: they were made with a different model or embedding recipe. Rerun 2b_write_negatives.py.)")
         else:
             keep, by_pair = [], {}
             for j, (p, k) in enumerate(zip(syn["pair_idx"], syn["keys"])):

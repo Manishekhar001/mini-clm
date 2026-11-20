@@ -1,11 +1,14 @@
 """Step 4 - train the two heads (state head + action head) in THREE stages.
 
-    stage 1  pre   Q&A pairs. Each question must score highest with its own answer.
+    stage 1  pre   Q&A pairs, plus 3 hard negatives per question. Each question must score highest with its own answer.
     stage 2  mid   Same Q&A pairs, plus up to 10 "hard negatives" per question (plausible wrong answers).
     stage 3  post  60% agent decisions + 40% Q&A replay (with hard negatives). Temperature frozen.
 
 Each stage starts from the heads the previous stage saved. The Qwen vectors are already computed
 (step 2), so we only train two tiny networks and every stage takes minutes, not days.
+
+The heads are "residual": they start as a do-nothing copy of the raw Qwen vectors and only learn small corrections
+(see clm.Head). Learning rates are low on purpose so training cannot scramble what Qwen already knows.
 
 The loss in plain words (InfoNCE): in a batch of N pairs, score every state against every action.
 Row i should peak at action i. We check this in both directions (state -> action, action -> state).
@@ -27,6 +30,7 @@ import torch.nn.functional as F
 
 import clm
 
+PRE_NEG = 3           # hard negatives per question in stage 1 (stage 2 uses all NUM_NEG). Random wrong answers alone are too easy.
 MAX_VAL = 2048        # test pairs used per dataset
 NUM_NEG = 10          # hard negatives per Q&A pair (set in 3_mine_negatives.py)
 
@@ -35,13 +39,14 @@ NUM_NEG = 10          # hard negatives per Q&A pair (set in 3_mine_negatives.py)
 #   pick:    the test number (lower is better) used to choose the best epoch to keep
 #   patience: stop after this many epochs without improvement
 STAGES = {
-    "pre":  {"init": None,  "lr": None,
-             "epochs": 30, "patience": 5, "learn_scale": True, "pick": "qa_loss",
-             "what": "Q&A pairs"},
-    "mid":  {"init": "pre", "lr": 1e-3,
+    "pre":  {"init": None,  "lr": 3e-4,
+             "epochs": 30, "patience": 5, "learn_scale": True, "pick": "tricky_loss",   # NOT qa_loss: random wrong answers are too easy and hid the original bug
+            
+             "what": "Q&A pairs + a few hard negatives each (warm-up)"},
+    "mid":  {"init": "pre", "lr": 1e-4,
              "epochs": 12, "patience": 3, "learn_scale": True, "pick": "tricky_loss",
              "what": "Q&A pairs + hard negatives"},
-    "post": {"init": "mid", "lr": 3e-4,
+    "post": {"init": "mid", "lr": 5e-5,
              "epochs": 12, "patience": 3, "learn_scale": False, "pick": "agent_loss",
              "what": "60% agent decisions + 40% Q&A replay with hard negatives, temperature frozen"},
 }
@@ -59,6 +64,8 @@ def load_data(device):
     D = {}
     for kind in ("qa", "agent"):
         d = np.load(clm.emb_path(kind))
+        if "recipe" not in d.files or str(d["recipe"]) != clm.RECIPE_ID:
+            raise SystemExit(f"{kind} vectors were made with a different (older) embedding recipe than clm.py says now. Rerun step 2 (python 2_embed.py), then 3.")
         if str(d["model_name"]) != clm.MODEL_NAME:
             raise SystemExit(f"{kind} vectors were made with {d['model_name']} but clm.py says {clm.MODEL_NAME}. Rerun step 2.")
         D[f"{kind}_s"] = torch.from_numpy(d["states"]).to(device)       # state vectors  (float16)
@@ -73,6 +80,13 @@ def load_data(device):
         if torch.unique(D[f"{kind}_g"][D[f"{kind}_val"]]).numel() < 20:   # the 16-option test needs wrong answers from other groups
             raise SystemExit(f"The {kind} test pairs come from fewer than 20 documents/recordings. "
                              "Rebuild with a bigger --max-pairs / --per-config.")
+    def _collapse(x):                                                # mean cosine between different texts, on a sample
+        return clm.mean_pairwise_cosine(x[torch.randperm(len(x), device=x.device)[:1000]].float().cpu().numpy())
+    cs, ca = _collapse(D["qa_s"]), _collapse(D["qa_a"])
+    print(f"Collapse check (mean cosine between different texts; near 1.0 = all texts look the same): states {cs:.3f}, actions {ca:.3f}")
+    if cs > 0.9:
+        print("WARNING: the state vectors are almost identical to each other, so the model cannot tell questions apart. "
+              "Check the recipe in clm.py and rerun step 2.")
     neg = np.load(clm.NEG_PATH)
     D["qa_neg"] = torch.from_numpy(neg["neg_idx"]).to(device)   # (N, 10) indices, -1 = none. i < N: answer of Q&A pair i. i >= N: a written negative
     extra = torch.from_numpy(neg["extra"]).to(device) if "extra" in neg.files else D["qa_a"][:0]
@@ -141,6 +155,8 @@ def evaluate(state_head, action_head, scale, D, n_options=16):
     zs, za, g = state_head(D["qa_s"][idx].float()), action_head(D["qa_a"][idx].float()), D["qa_g"][idx]
     m["qa_loss"] = contrastive_loss(zs, za, scale, g).item()
     m["qa_acc"] = choose_accuracy(zs, za, g, n_options)
+    n_s = len(zs)
+    m["state_cos"] = ((zs @ zs.T).sum() - n_s).item() / max(n_s * (n_s - 1), 1)   # mean cosine between different states (unit vectors); ~1 = collapsed
 
     zn, valid = neg_vectors(action_head, D["neg_pool"], D["qa_neg"][idx])
     has = valid.any(dim=1)                                           # only pairs that have at least one negative
@@ -202,7 +218,7 @@ def train_stage(stage, args, D, device):
         for j in range(0, len(order) - per_step + 1, per_step):
             rows = order[j:j + per_step]
             if stage == "pre":
-                s, a, g, neg_rows = D["qa_s"][rows], D["qa_a"][rows], D["qa_g"][rows], None
+                s, a, g, neg_rows = D["qa_s"][rows], D["qa_a"][rows], D["qa_g"][rows], D["qa_neg"][rows][:, :PRE_NEG]
             elif stage == "mid":
                 s, a, g, neg_rows = D["qa_s"][rows], D["qa_a"][rows], D["qa_g"][rows], D["qa_neg"][rows]
             else:
@@ -234,7 +250,11 @@ def train_stage(stage, args, D, device):
             best, best_epoch, note = m[cfg["pick"]], epoch, "  <- best, saved"
             clm.save_heads(clm.ckpt_path(stage), state_head, action_head, log_scale, in_dim, stage, m)
         print(f"epoch {epoch:2d}  train loss {np.mean(losses):6.3f} | test: Q&A {m['qa_acc']:5.1%}  "
-              f"tricky {m['tricky_acc']:5.1%}  agent {m['agent_acc']:5.1%}{note}")
+              f"tricky {m['tricky_acc']:5.1%}  agent {m['agent_acc']:5.1%} | "
+              f"temp {log_scale.detach().exp().clamp(max=100.0).item():5.1f}  state-cos {m['state_cos']:.2f}{note}")
+        if m["state_cos"] > 0.9:
+            print("  WARNING: the state head maps different questions to nearly the same vector (state-cos > 0.9). "
+                  "That is the collapse bug: do not trust this model.")
         if epoch - best_epoch >= cfg["patience"]:
             print(f"No improvement in '{cfg['pick']}' for {cfg['patience']} epochs - stopping early.")
             break
@@ -260,6 +280,7 @@ def report(D, device):
     for name, m in rows:
         print(f"{name:20s} {m['qa_acc']:14.1%} {m['tricky_acc']:12.1%} {m['agent_acc']:16.1%}")
     print("Tricky Q&A = the right answer against its hard negatives. Agent = pick the right agent action.")
+    print("Trust 'Tricky Q&A'. 'Q&A (1 of 16)' uses random wrong answers (a name vs a date), which are easy and hid the original bug.")
 
 
 def main():
