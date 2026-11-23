@@ -9,6 +9,7 @@ dependencies = [
     "numpy",
     "requests",
     "huggingface_hub",
+    "sentence-transformers>=5.7.0",
 ]
 
 [tool.uv.sources]

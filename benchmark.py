@@ -17,6 +17,12 @@ For every benchmark you get a table with:
     most common position        always pick option A / B / ... whichever is right most often
     raw Qwen vectors            the frozen backbone with NO trained heads (the number the heads must beat)
     after 'pre' / 'mid' / 'post'  the trained model, stage by stage
+    Qwen log-likelihood         the usual way to score a small LM: the SAME Qwen, one forward pass per option, pick the option
+                                with the highest log-probability (acc_norm divides by the option's length). This is the
+                                yardstick for the CLM's speed claim: how much accuracy do you give up for it?
+    bge-small / all-MiniLM      ready-made sentence embedders used as they are, no training (see baselines.py).
+                                If one of them beats the trained heads, say so in the README.
+All rows use the SAME sampled questions and the same text, so they can be compared directly.
 The +/- is a 95% margin of error: two numbers closer than that are not clearly different.
 
 How to read it: this is a small frozen scorer, not a language model. It compares the meaning of the situation with the
@@ -28,6 +34,8 @@ Run:
     python benchmark.py --bench race             # one benchmark
     python benchmark.py --bench race --limit 0   # every question (slower)
     python benchmark.py --stage post             # only one stage of the trained heads
+    python benchmark.py --baselines none         # skip the baseline rows (much faster)
+    python benchmark.py --baselines ll           # only the Qwen log-likelihood rows  (or: embedders / all)
 """
 import argparse
 import math
@@ -36,6 +44,7 @@ import random
 import numpy as np
 import torch
 
+import baselines
 import clm
 
 
@@ -141,7 +150,7 @@ def accuracy_text(correct, n):
     return f"{p:6.1%} +/- {margin:4.1%}"
 
 
-def run_benchmark(name, scorer, limit, seed):
+def run_benchmark(name, scorer, limit, seed, baseline_names):
     print(f"\n=== {name} ===")
     cases = BENCHMARKS[name]()
     if limit and limit < len(cases):
@@ -155,12 +164,14 @@ def run_benchmark(name, scorer, limit, seed):
     rows.append(("longest option", sum(p == a for p, a in zip(longest, answers))))
     common = max(set(answers), key=answers.count)
     rows.append(("most common position", sum(a == common for a in answers)))
-    for system, preds in predict(scorer, cases).items():
+    all_preds = predict(scorer, cases)
+    all_preds.update(baselines.predict(cases, scorer.tok, baseline_names))   # the SAME questions for every row
+    for system, preds in all_preds.items():
         rows.append((system, sum(p == a for p, a in zip(preds, answers))))
 
-    print(f"  {'':24s} {'accuracy (95% margin)':>24s}")
+    print(f"  {'':32s} {'accuracy (95% margin)':>24s}")
     for label, correct in rows:
-        print(f"  {label:24s} {accuracy_text(correct, n):>24s}")
+        print(f"  {label:32s} {accuracy_text(correct, n):>24s}")
     return n, rows
 
 
@@ -171,25 +182,30 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--stage", choices=["pre", "mid", "post", "all"], default="all",
                         help="which trained heads to test (default: all that exist)")
+    parser.add_argument("--baselines", choices=["none", "ll", "embedders", "all"], default="all",
+                        help="extra rows to compare against: Qwen log-likelihood (ll), ready-made embedders, both (all), or none")
     args = parser.parse_args()
 
     scorer = clm.Scorer(("pre", "mid", "post") if args.stage == "all" else (args.stage,))
     names = list(BENCHMARKS) if args.bench == "all" else [args.bench]
-    results = {name: run_benchmark(name, scorer, args.limit, args.seed) for name in names}
+    baseline_names = baselines.parse(args.baselines)
+    results = {name: run_benchmark(name, scorer, args.limit, args.seed, baseline_names) for name in names}
 
     if len(names) > 1:                                     # one summary table with the systems side by side
         labels = [label for label, _ in results[names[0]][1]]
         print("\n================ SUMMARY (accuracy) ================")
-        print(f"{'':24s}" + "".join(f"{name:>15s}" for name in names))
+        print(f"{'':32s}" + "".join(f"{name:>15s}" for name in names))
         for label in labels:
             cells = ""
             for name in names:
                 n, rows = results[name]
                 correct = dict(rows)[label]
                 cells += f"{correct / n:15.1%}"
-            print(f"{label:24s}{cells}")
+            print(f"{label:32s}{cells}")
     print("\nRead it like this: a trained row clearly above 'raw Qwen vectors' means the heads helped on data they never saw. "
-          "A row near 'chance' means the model cannot do that kind of question.")
+          "A row near 'chance' means the model cannot do that kind of question.\n"
+          "Compare with 'Qwen log-likelihood' to see what accuracy the CLM gives up for its speed (bench_latency.py has the speed).\n"
+          "The (acc_norm) row is not meaningful for BoolQ (Yes and No differ in length); read the (acc) row there.")
 
 
 if __name__ == "__main__":
