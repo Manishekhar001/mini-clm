@@ -48,10 +48,8 @@ def embed_file(kind, pairs_path, tok, model):
         if os.path.exists(path):             # finished in an earlier run
             continue
         part = pairs[start:start + CHUNK]
-        state_ids = [clm.state_to_ids(tok, p["state"]) for p in part]
-        action_ids = [clm.action_to_ids(tok, p["action"]) for p in part]
-        states = clm.embed(model, tok, state_ids)
-        actions = clm.embed(model, tok, action_ids)
+        states = clm.embed_states(model, tok, [p["state"] for p in part])
+        actions = clm.embed_actions(model, tok, [p["action"] for p in part])
         np.savez(path + ".tmp.npz", states=states, actions=actions)
         os.replace(path + ".tmp.npz", path)  # only a fully written chunk counts as done
 

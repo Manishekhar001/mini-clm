@@ -46,7 +46,7 @@ def make_methods(scorer, stage, lm, cases):
     state_head, action_head, _ = scorer.heads[stage]
 
     with torch.inference_mode():                         # option vectors for the "cached" method, made BEFORE any timing
-        cached = [action_head(scorer._vectors([clm.action_to_ids(tok, o) for o in c["options"]], "action")) for c in cases]
+        cached = [action_head(scorer.action_vectors(c["options"])) for c in cases]
 
     def clm_full(i):
         probs = scorer.rank(cases[i]["state"], cases[i]["options"])[stage]
@@ -54,8 +54,7 @@ def make_methods(scorer, stage, lm, cases):
 
     @torch.inference_mode()
     def clm_cached(i):
-        state_ids = clm.state_to_ids(tok, [{"role": "user", "content": cases[i]["state"]}])
-        state_vec = scorer._vectors([state_ids], "state")
+        state_vec = scorer.state_vectors([cases[i]["state"]])
         return int((state_head(state_vec) @ cached[i].T).argmax())
 
     def qwen_ll(i, batched):

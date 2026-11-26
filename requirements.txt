@@ -1,0 +1,9 @@
+# Same dependencies as pyproject.toml. Install the CUDA build of PyTorch first, for example:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+torch>=2.6,<2.8
+transformers>=4.51,<5
+datasets
+numpy
+requests
+huggingface_hub
+sentence-transformers

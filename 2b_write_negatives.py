@@ -135,7 +135,7 @@ def save_vectors(pairs, done):
     if not texts:
         raise SystemExit("The writer produced no usable wrong answers. Try --num-pairs 500 and look at the output.")
     tok, model = clm.load_backbone()
-    vectors = clm.embed(model, tok, [clm.action_to_ids(tok, t) for t in texts])
+    vectors = clm.embed_actions(model, tok, texts)
     vectors = clm.center_saved(vectors, "action")      # the same centering as the real answers (needs 2_embed.py to have run)
     np.savez(clm.SYN_NEG_PATH, pair_idx=np.array(idx, dtype=np.int64),
              keys=np.array([clm.pair_key(pairs[i]) for i in idx], dtype=np.int64),
