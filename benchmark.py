@@ -112,8 +112,6 @@ BENCHMARKS = {
 @torch.inference_mode()
 def predict(scorer, cases):
     """Return {system name: [index of the option it picks, per case]} for raw Qwen vectors and every trained stage."""
-    tok, model, device = scorer.tok, scorer.model, scorer.device
-
     # Each distinct option text is embedded once (yes/no and repeated answers are common).
     texts, text_index, option_rows = [], {}, []
     for c in cases:
@@ -126,11 +124,8 @@ def predict(scorer, cases):
         option_rows.append(rows)
 
     print(f"  embedding {len(cases)} situations and {len(texts)} distinct options ...")
-    state_ids = [clm.state_to_ids(tok, [{"role": "user", "content": c["state"]}]) for c in cases]
-    S = clm.center_saved(clm.embed(model, tok, state_ids), "state")              # the SAME recipe as training
-    A = clm.center_saved(clm.embed(model, tok, [clm.action_to_ids(tok, t) for t in texts]), "action")
-    S = torch.from_numpy(S).float().to(device)
-    A = torch.from_numpy(A).float().to(device)
+    S = scorer.state_vectors([c["state"] for c in cases])                      # the SAME recipe as training
+    A = scorer.action_vectors(texts)
 
     systems = {"raw Qwen vectors": (None, None)}                                # no heads = the frozen backbone alone
     for stage, (state_head, action_head, _) in scorer.heads.items():

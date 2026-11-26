@@ -31,6 +31,7 @@ import torch.nn.functional as F
 import clm
 
 PRE_NEG = 3           # hard negatives per question in stage 1 (stage 2 uses all NUM_NEG). Random wrong answers alone are too easy.
+DUP_COS = 0.999       # two head outputs this close come from the same text: never count one as the other's wrong answer
 MAX_VAL = 2048        # test pairs used per dataset
 NUM_NEG = 10          # hard negatives per Q&A pair (set in 3_mine_negatives.py)
 
@@ -111,16 +112,25 @@ def neg_vectors(action_head, qa_actions, neg_rows):
 
 
 def contrastive_loss(state_vecs, action_vecs, scale, group, neg_vecs=None, neg_valid=None):
-    """Symmetric InfoNCE, optionally with hard negatives added to the state -> action direction."""
+    """Symmetric InfoNCE, optionally with hard negatives added to the state -> action direction.
+
+    False negatives are masked out: pairs from the same document / recording, and in-batch duplicates (the same answer
+    text, e.g. "Yes" or a common agent command like `ls`, appearing in two different pairs). Without that mask the
+    loss punished the model for scoring a CORRECT answer highly, which pulls identical answers apart."""
     logits = scale * state_vecs @ action_vecs.T                      # N x N table of scores
-    same = group[:, None] == group[None, :]                          # pairs from the same document / recording ...
-    same.fill_diagonal_(False)                                       # ... are not counted as wrong answers
+    with torch.no_grad():
+        same = group[:, None] == group[None, :]                      # pairs from the same document / recording
+        same |= (action_vecs @ action_vecs.T) > DUP_COS              # the same answer text in two pairs
+        same |= (state_vecs @ state_vecs.T) > DUP_COS                # the same situation in two pairs
+        same.fill_diagonal_(False)                                   # ... are not counted as wrong answers
     logits = logits.masked_fill(same, float("-inf"))
     labels = torch.arange(len(logits), device=logits.device)         # the right answer for row i is column i
 
     forward_logits = logits
     if neg_vecs is not None:                                         # extra wrong answers for each state
         neg_logits = scale * torch.einsum("bd,bkd->bk", state_vecs, neg_vecs)
+        with torch.no_grad():                                        # a "negative" identical to the answer is not wrong
+            neg_valid = neg_valid & (torch.einsum("bd,bkd->bk", action_vecs, neg_vecs) <= DUP_COS)
         neg_logits = neg_logits.masked_fill(~neg_valid, float("-inf"))
         forward_logits = torch.cat([logits, neg_logits], dim=1)
     state_to_action = F.cross_entropy(forward_logits, labels)        # "which answer matches this question?"

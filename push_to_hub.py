@@ -33,7 +33,7 @@ import clm
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STAGE_DIR = os.path.join(HERE, "hf_upload")          # the folder that gets uploaded (made fresh every run)
-CODE_FILES = ["clm.py", "5_demo.py", "demo_cases.json", "benchmark.py", "requirements.txt"]
+CODE_FILES = ["clm.py", "5_demo.py", "demo_cases.json", "benchmark.py", "baselines.py", "requirements.txt"]   # benchmark.py imports baselines.py
 STAGES = ("pre", "mid", "post")
 
 

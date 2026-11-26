@@ -45,10 +45,12 @@ One question at a time (batch size 1) on an RTX 3050 6 GB laptop GPU, median / 9
 
 | method | RACE (long passages) | ARC-Easy (short questions) |
 |---|---|---|
-| CLM | - | - |
-| CLM, option vectors cached (only when the options are known in advance) | - | - |
-| **Qwen log-likelihood, 1 batch of 4 (baseline)** | - | - |
-| Qwen log-likelihood, 4 passes (reference) | - | - |
+| CLM | not measured yet | not measured yet |
+| CLM, option vectors cached (only when the options are known in advance) | not measured yet | not measured yet |
+| **Qwen log-likelihood, 1 batch of 4 (baseline)** | not measured yet | not measured yet |
+| Qwen log-likelihood, 4 passes (reference) | not measured yet | not measured yet |
+
+Fill this table from the output of `python bench_latency.py` (it prints it in Markdown).
 
 The CLM saves time because it reads the situation once instead of once per option, so the gain is largest on long passages and small on short questions. Accuracy against the same baseline is in the accuracy table above.
 
@@ -97,7 +99,14 @@ python eval_stage3.py                # did stage 3 learn anything? held-out agen
 python push_to_hub.py --repo YOU/mini-clm --dry-run    # prepare a Hugging Face upload
 ```
 
-The embedding recipe lives in one place, `clm.py` (settings block). Changing any of it requires rerunning steps 2 to 4; old vectors and checkpoints are rejected automatically. `README_detailed.md` has the long step-by-step guide and troubleshooting notes.
+The embedding recipe lives in one place, `clm.py` (settings block). Changing any of it requires rerunning steps 2 to 4; old vectors and checkpoints are rejected automatically.
+
+### Recipe v2 (fixes that change the numbers above; rerun steps 2-4 and `benchmark.py`)
+
+- **States: `mean+last` pooling.** Mean pooling over a long passage drowned the question, so every question about one RACE passage got nearly the same vector. The last token (`Answer:`) has read the question and is about to predict the answer; it is now averaged in.
+- **Options: the `Answer: ` prefix is no longer pooled.** Qwen is causal, so the prefix tokens see only themselves and their vectors were identical for every option; for a short option like `Tokyo` they were 2 of 3 pooled tokens.
+- **Training: false negatives are masked.** The same answer text in two pairs of a batch (`Yes`, a common agent command) was counted as a wrong answer, which pushed identical answers apart.
+- **Hard negatives: stricter filter.** Rewordings (`the Eiffel Tower` / `Eiffel Tower`), containments (`1889` / `in 1889`), near-identical vectors and repeats are no longer used as wrong answers.
 
 ## Files
 

@@ -20,6 +20,7 @@ Run:
 """
 import json
 import os
+import re
 import zlib
 
 import numpy as np
@@ -29,6 +30,24 @@ import clm
 
 NEG_PER_PAIR = 10    # up to 10 hard negatives per pair
 NEG_WRITTEN = 3      # at most this many of them are written ones (from 2b_write_negatives.py)
+CANDIDATES = 4 * NEG_PER_PAIR   # the most similar answers looked at per pair, before the false-negative filter
+NEAR_DUP_COS = 0.97  # an "other" answer this close to the right one is almost surely the same answer reworded
+
+ARTICLES = re.compile(r"\b(a|an|the)\b")
+PUNCT = re.compile(r"[^\w\s]")
+
+
+def normalise(text):
+    """SQuAD-style answer normalisation: lower case, no punctuation, no articles, single spaces.
+    'The Eiffel Tower.' and 'eiffel tower' become the same answer."""
+    return " ".join(ARTICLES.sub(" ", PUNCT.sub(" ", text.lower())).split())
+
+
+def same_answer(a, b):
+    """True when two normalised answers are the same or one contains the other as whole words ('1889' / 'in 1889')."""
+    if not a or not b:
+        return a == b
+    return a == b or f" {a} " in f" {b} " or f" {b} " in f" {a} "
 
 
 def ascii_safe(text, n=90):
@@ -51,24 +70,42 @@ def main():
 
     actions = torch.from_numpy(data["actions"]).to(device).float()
     group = torch.from_numpy(data["group"]).to(device)
-    # A number that is the same for answers with the same text (ignoring case and spacing).
-    text_key = torch.tensor([zlib.crc32(" ".join(p["action"].lower().split()).encode()) for p in pairs],
-                            dtype=torch.int64, device=device)
+    # A number that is the same for answers with the same normalised text.
+    norm = [normalise(p["action"]) for p in pairs]
+    text_key = torch.tensor([zlib.crc32(t.encode()) for t in norm], dtype=torch.int64, device=device)
     is_val = data["is_val"]
 
+    # A false negative (a "wrong" answer that is really right) teaches the model the opposite of the truth, and these
+    # are the MOST similar answers, so they are exactly where false negatives live. Filter in two passes:
+    #   on the GPU: same document, or the same normalised text
+    #   on the CPU: near-identical vectors, one answer containing the other, or a repeat inside the same list
     neg_idx = np.full((n, NEG_PER_PAIR), -1, dtype=np.int64)       # -1 = "no negative here"
+    dropped = 0
     for pool in (np.flatnonzero(~is_val), np.flatnonzero(is_val)):
         pool_t = torch.from_numpy(pool).to(device)
         pool_actions, pool_group, pool_key = actions[pool_t], group[pool_t], text_key[pool_t]
-        k = min(NEG_PER_PAIR, len(pool))
+        k = min(CANDIDATES, len(pool))
         for start in range(0, len(pool), 1024):
             rows = slice(start, start + 1024)
             sims = pool_actions[rows] @ pool_actions.T                       # similarity of every answer to the correct one
             bad = (pool_group[rows, None] == pool_group[None, :]) | (pool_key[rows, None] == pool_key[None, :])
             sims = sims.masked_fill(bad, -2.0)                               # never pick same-document / same-text answers
             values, top = sims.topk(k, dim=1)                                # the most similar remaining answers
-            top = pool_t[top].masked_fill(values <= -2.0, -1)                # back to global indices; -1 if nothing valid
-            neg_idx[pool[start:start + 1024], :k] = top.cpu().numpy()
+            values, top = values.cpu().tolist(), pool_t[top].cpu().tolist()  # back to global indices
+            for r, i in enumerate(pool[start:start + 1024]):
+                picked, seen = [], [norm[i]]
+                for v, j in zip(values[r], top[r]):
+                    if v <= -2.0:
+                        break                                                # only masked answers are left
+                    if v > NEAR_DUP_COS or any(same_answer(norm[j], s) for s in seen):
+                        dropped += 1
+                        continue
+                    picked.append(j)
+                    seen.append(norm[j])
+                    if len(picked) == NEG_PER_PAIR:
+                        break
+                neg_idx[i, :len(picked)] = picked
+    print(f"Dropped {dropped} likely false negatives (rewordings / containments / repeats of the right answer).")
 
     # Add the negatives WRITTEN by 2b_write_negatives.py (optional). Their vectors are stored after the pairs, so a
     # number >= n in neg_idx means "written negative number (number - n)".

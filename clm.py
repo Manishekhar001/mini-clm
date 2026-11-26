@@ -37,17 +37,26 @@ MAX_ACTION_TOKENS = 128          # an option is cut to its FIRST 128 tokens
 EMBED_BATCH = 8                  # sequences per GPU batch while embedding. Lower it if you run out of memory.
 HEAD_WIDTH = 1024                # hidden width of each head
 HEAD_ARCH = "residual-v1"        # bumped when the head design changes; older checkpoints are then refused
-PROJ_DIM = 256                   # (not used any more: the residual head outputs a vector as big as its input)
 
 # ---- The embedding recipe. Changing ANY of these means re-running steps 2, 2b, 3 and 4. ----
-# Run 2c_compare_extraction.py to pick these by measured accuracy instead of guessing.
 STATE_MODE = "plain"             # "plain" = the raw text (recommended). "chatml" / "chatml_gen" = Qwen chat template (the old, broken recipe)
 STATE_SUFFIX = "\n\nAnswer:"     # added to the end of every plain-text state
-ACTION_PREFIX = "Answer: "               # added to the start of every option, e.g. "Answer: ". Empty is best with mean pooling
-POOLING = "mean"                 # "mean" = average of all token vectors, "last" = only the last token's vector
+ACTION_PREFIX = "Answer: "       # added to the start of every option. Its tokens are context only: they are NOT pooled (see below)
+# Pooling: "mean" = average of all token vectors, "last" = the last token only, "mean+last" = both, averaged.
+# States use "mean+last": mean pooling over a 1000-token passage drowns the question (every question about the same
+# passage got nearly the same vector). The last token ("Answer:") is where a causal LM has already read the question
+# and is about to predict the answer, so it carries exactly the information the option has to match.
+# The ChatML "\n" last token of the first version is the one that collapsed; the plain "Answer:" token does not.
+STATE_POOLING = "mean+last"
+ACTION_POOLING = "mean"
+# Qwen is causal: the "Answer: " prefix tokens see only themselves, so their vectors are IDENTICAL for every option.
+# Pooling them mixed 2 constant vectors into every short option ("Answer: Tokyo" = 2 constant tokens + 1 real one).
+SKIP_ACTION_PREFIX = True
+POOLING = f"state:{STATE_POOLING},action:{ACTION_POOLING}"   # for display (push_to_hub.py)
 CENTER = True                    # subtract the training-data average vector (states and actions separately)
 
-RECIPE = f"state={STATE_MODE}{STATE_SUFFIX!r}|action={ACTION_PREFIX!r}|pool={POOLING}|center={CENTER}"
+RECIPE = (f"state={STATE_MODE}{STATE_SUFFIX!r}|action={ACTION_PREFIX!r}|pool={POOLING}"
+          f"|skip_prefix={SKIP_ACTION_PREFIX}|center={CENTER}")
 RECIPE_ID = f"{zlib.crc32(RECIPE.encode()):08x}"   # stored with every vector file and every checkpoint; a mismatch stops the run
 
 # ================================== FILE LOCATIONS ================================
@@ -93,7 +102,7 @@ def render_plain(kept):
 def state_to_ids(tok, messages, mode=None, suffix=None):
     """Turn a conversation (list of {"role", "content"}) into token ids, keeping the END of it.
 
-    mode / suffix default to STATE_MODE / STATE_SUFFIX. (2c_compare_extraction.py passes other values to compare them.)"""
+    mode / suffix default to STATE_MODE / STATE_SUFFIX."""
     mode = STATE_MODE if mode is None else mode
     suffix = STATE_SUFFIX if suffix is None else suffix
     kept, chars = [], 0
@@ -117,9 +126,22 @@ def state_to_ids(tok, messages, mode=None, suffix=None):
 
 def action_to_ids(tok, text, prefix=None):
     """Turn an option (plain text) into token ids, keeping the START of it."""
+    return action_tokens(tok, text, prefix)[0]
+
+
+def action_tokens(tok, text, prefix=None):
+    """(token ids, number of leading prefix tokens to leave out of pooling) for one option."""
     prefix = ACTION_PREFIX if prefix is None else prefix
-    ids = tok(prefix + (text or " "), add_special_tokens=False)["input_ids"]
-    return ids[:MAX_ACTION_TOKENS] or [tok.pad_token_id]
+    ids = tok(prefix + (text or " "), add_special_tokens=False)["input_ids"][:MAX_ACTION_TOKENS] or [tok.pad_token_id]
+    skip = 0
+    if SKIP_ACTION_PREFIX and prefix:
+        # The trailing space of the prefix usually merges into the first word (" Tokyo"), so count only the tokens
+        # that the option really shares with the prefix on its own.
+        prefix_ids = tok(prefix, add_special_tokens=False)["input_ids"]
+        while skip < min(len(prefix_ids), len(ids)) and ids[skip] == prefix_ids[skip]:
+            skip += 1
+        skip = min(skip, len(ids) - 1)                  # always pool at least one real token
+    return ids, skip
 
 
 # ================================== THE BACKBONE ==================================
@@ -146,13 +168,16 @@ def load_backbone():
 
 
 @torch.inference_mode()
-def embed_all(model, tok, token_lists, modes=("mean", "last"), batch_size=EMBED_BATCH):
+def embed_all(model, tok, token_lists, modes=("mean", "last"), batch_size=EMBED_BATCH, skips=None):
     """Run token lists through Qwen once and return {mode: one unit-length vector per list (float16, N x hidden)}.
 
-    mode "mean" = average of the hidden states of all real tokens (padding is ignored).
-    mode "last" = the hidden state of the last token only."""
+    mode "mean"      = average of the hidden states of all real tokens (padding is ignored).
+    mode "last"      = the hidden state of the last token only.
+    mode "mean+last" = unit_length(unit(mean) + unit(last)).
+    skips[i] = how many leading tokens of list i are read by Qwen but left out of the mean (constant prefixes)."""
     device = next(model.parameters()).device
     pad_id = tok.pad_token_id
+    skips = [0] * len(token_lists) if skips is None else skips
     # Longest first: padding is minimal, and an out-of-memory error shows up immediately, not an hour in.
     order = np.argsort([-len(t) for t in token_lists])
     out = {m: np.zeros((len(token_lists), model.config.hidden_size), dtype=np.float16) for m in modes}
@@ -162,20 +187,30 @@ def embed_all(model, tok, token_lists, modes=("mean", "last"), batch_size=EMBED_
         longest = max(len(token_lists[i]) for i in idx)
         ids = torch.full((len(idx), longest), pad_id, dtype=torch.long)
         mask = torch.zeros((len(idx), longest), dtype=torch.long)
+        pool = torch.zeros((len(idx), longest), dtype=torch.float32)
         for row, i in enumerate(idx):
             t = token_lists[i]
             ids[row, longest - len(t):] = torch.tensor(t)   # pad on the LEFT so the last token is always real
             mask[row, longest - len(t):] = 1
+            pool[row, longest - len(t) + min(skips[i], len(t) - 1):] = 1.0   # tokens that count for the mean
         mask = mask.to(device)
+        # Left padding with no position_ids is safe: RoPE only depends on the distance between two real tokens.
         hidden = model(input_ids=ids.to(device), attention_mask=mask, use_cache=False).last_hidden_state.float()   # no cache: saves GPU memory
-        weights = mask.unsqueeze(-1).float()
+        weights = pool.to(device).unsqueeze(-1)
+
+        def unit(v):
+            return v / (v.norm(dim=-1, keepdim=True) + 1e-12)
+
         for m in modes:
+            mean_vec = (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)   # average over pooled tokens only
             if m == "last":
                 vec = hidden[:, -1]                                           # hidden state of the last token
             elif m == "mean":
-                vec = (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)   # average over real tokens only
+                vec = mean_vec
+            elif m == "mean+last":
+                vec = unit(mean_vec) + unit(hidden[:, -1])
             else:
-                raise ValueError(f"unknown pooling '{m}' (use 'mean' or 'last')")
+                raise ValueError(f"unknown pooling '{m}' (use 'mean', 'last' or 'mean+last')")
             vec = vec / (vec.norm(dim=-1, keepdim=True) + 1e-12)              # unit length
             out[m][idx] = vec.cpu().numpy().astype(np.float16)
 
@@ -185,10 +220,21 @@ def embed_all(model, tok, token_lists, modes=("mean", "last"), batch_size=EMBED_
     return out
 
 
-def embed(model, tok, token_lists, batch_size=EMBED_BATCH, pooling=None):
-    """One unit-length vector per token list (float16, N x hidden), pooled as POOLING says. NOT centered yet (see center_*)."""
-    pooling = POOLING if pooling is None else pooling
-    return embed_all(model, tok, token_lists, (pooling,), batch_size)[pooling]
+def embed(model, tok, token_lists, batch_size=EMBED_BATCH, pooling="mean", skips=None):
+    """One unit-length vector per token list (float16, N x hidden). NOT centered yet (see center_*).
+    Prefer embed_states / embed_actions, which apply the full recipe."""
+    return embed_all(model, tok, token_lists, (pooling,), batch_size, skips)[pooling]
+
+
+def embed_states(model, tok, states, batch_size=EMBED_BATCH):
+    """Situations (each a list of {"role", "content"} messages) -> raw vectors, with the state recipe. NOT centered."""
+    return embed(model, tok, [state_to_ids(tok, s) for s in states], batch_size, STATE_POOLING)
+
+
+def embed_actions(model, tok, texts, batch_size=EMBED_BATCH):
+    """Option texts -> raw vectors, with the action recipe (prefix read but not pooled). NOT centered."""
+    encoded = [action_tokens(tok, t) for t in texts]
+    return embed(model, tok, [ids for ids, _ in encoded], batch_size, ACTION_POOLING, [s for _, s in encoded])
 
 
 # ================================== CENTERING ==================================
@@ -320,19 +366,23 @@ class Scorer:
         if not self.heads:
             raise SystemExit("No trained heads found. Run `python 4_train.py --stage all` first.")
 
-    def _vectors(self, token_lists, which):
-        """Embed with the SAME recipe as training: pooling, then the saved centering."""
-        vecs = center_saved(embed(self.model, self.tok, token_lists), which)
+    def state_vectors(self, states):
+        """Embed situations with the SAME recipe as training: state pooling, then the saved centering."""
+        states = [[{"role": "user", "content": s}] if isinstance(s, str) else s for s in states]
+        vecs = center_saved(embed_states(self.model, self.tok, states), "state")
+        return torch.from_numpy(vecs).float().to(self.device)
+
+    def action_vectors(self, texts):
+        """Embed options with the SAME recipe as training: action pooling, then the saved centering."""
+        vecs = center_saved(embed_actions(self.model, self.tok, texts), "action")
         return torch.from_numpy(vecs).float().to(self.device)
 
     @torch.inference_mode()
     def rank(self, state, options):
         """state: text (or a list of {"role", "content"} messages). options: list of texts.
         Returns {stage: [probability of each option, in the order given]}. Each list adds up to 1."""
-        if isinstance(state, str):
-            state = [{"role": "user", "content": state}]
-        state_vec = self._vectors([state_to_ids(self.tok, state)], "state")
-        option_vecs = self._vectors([action_to_ids(self.tok, o) for o in options], "action")
+        state_vec = self.state_vectors([state])
+        option_vecs = self.action_vectors(list(options))
         result = {}
         for stage, (state_head, action_head, scale) in self.heads.items():
             scores = scale * (state_head(state_vec) @ action_head(option_vecs).T)   # cosine x scale
